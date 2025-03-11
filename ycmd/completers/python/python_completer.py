@@ -20,7 +20,10 @@ from ycmd.completers.completer import Completer, SignatureHelpAvailalability
 from ycmd.utils import ( CodepointOffsetToByteOffset,
                          ExpandVariablesInPath,
                          FindExecutable,
-                         LOGGER )
+                         LOGGER,
+                         ReadFile)
+from ycmd.request_wrap import RequestWrap
+import json
 
 import difflib
 import itertools
@@ -28,6 +31,21 @@ import jedi
 import os
 import parso
 from threading import Lock
+
+
+def safe_serialize(obj):
+    if isinstance(obj, dict):
+        return {k: safe_serialize(v) for k, v in obj.items()}
+    elif hasattr(obj, '__dict__'):
+        return {k: safe_serialize(v) for k, v in obj.__dict__.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [safe_serialize(item) for item in obj]
+    else:
+        try:
+            json.dumps(obj, indent=2)
+            return obj
+        except (TypeError, OverflowError):
+            return f"<{type(obj).__name__}>"
 
 
 class PythonCompleter( Completer ):
@@ -272,6 +290,170 @@ class PythonCompleter( Completer ):
         candidate[ 'extra_data' ] = self._GetExtraData( completion )
     return candidates
 
+  def _GoToImplementation( self, request_data ):
+      """Navigate to the implementation of the symbol under the cursor.
+
+      This method repeatedly calls GoToDefinition until it either:
+      - Reaches a stable location (location doesn't change anymore)
+      - Reaches a non-import definition
+
+      This effectively finds where code is actually implemented vs just imported.
+      """
+      # Start with the current request data
+      current_request_data = request_data
+
+      # Keep track of previous locations to detect cycles or no movement
+      previous_locations = []
+
+      max_iterations = 10  # Avoid infinite loops in case of circular references
+      iterations = 0
+
+      while iterations < max_iterations:
+        iterations += 1
+        LOGGER.info( f"GoToImplementation: Iteration {iterations}/{max_iterations}" )
+
+        try:
+          # Try to go to definition - IMPORTANT: We're calling this outside
+          # the jedi_lock to avoid deadlock since _GoToDefinition acquires the lock itself
+          LOGGER.info( f"GoToImplementation: Calling GoToDefinition on {current_request_data['filepath']}:{current_request_data['line_num']}" )
+
+          definition_result = self._GoToDefinition( current_request_data )
+
+          # If we got a list of results, just take the first one
+          if isinstance( definition_result, list ):
+            if not definition_result:
+              LOGGER.info( "GoToImplementation: No definitions found" )
+              raise RuntimeError( "Can't jump to implementation." )
+            LOGGER.info( f"GoToImplementation: Got {len(definition_result)} definitions, using first one" )
+            current_location = definition_result[ 0 ]
+          else:
+            current_location = definition_result
+
+          LOGGER.info( f"GoToImplementation: Definition found at {current_location['filepath']}:{current_location['line_num']}" )
+
+          # Check if we've seen this location before (cycle or no movement)
+          location_tuple = (
+            current_location.get( 'filepath', '' ),
+            current_location.get( 'line_num', 0 ),
+            current_location.get( 'column_num', 0 )
+          )
+
+          if location_tuple in previous_locations:
+            LOGGER.info( f"GoToImplementation: Location already visited, stopping here" )
+            # We've reached a stable point or a cycle, return current location
+            return current_location
+
+          previous_locations.append( location_tuple )
+
+          # Now we need to check if this is an import statement
+          filepath = current_location[ 'filepath' ]
+          line_num = current_location[ 'line_num' ]
+
+          # Create a new request data with the appropriate position for the next lookup
+          # Copy the original request to maintain all the needed fields
+          new_request_data = {
+            'command_arguments': ['GoToDefinition'],
+            'filepath': filepath,
+            'line_num': line_num,
+            'column_num': current_location[ 'column_num' ],
+            'file_data': {},
+            # 'filetypes': request_data[ 'filetypes' ],
+            # 'extra_conf_data': request_data.get( 'extra_conf_data', {} ),
+          }
+
+          # Add any other required fields that might be needed
+          # for field in ['force_semantic', 'working_dir']:
+          #   if field in request_data:
+          #     new_request_data[field] = request_data[field]
+
+          # Copy file_data we already know about
+          for path, data in request_data[ 'file_data' ].items():
+            if isinstance( data, dict ):
+              new_request_data[ 'file_data' ][ path ] = data.copy()
+            else:
+              new_request_data[ 'file_data' ][ path ] = data
+
+          # If the file is not in file_data, we need to read it
+          if filepath not in new_request_data.get( 'file_data', {} ):
+            try:
+              LOGGER.info( f"GoToImplementation: Reading file {filepath}" )
+              file_contents = ReadFile( filepath )
+              if 'file_data' not in new_request_data:
+                new_request_data[ 'file_data' ] = {}
+              new_request_data[ 'file_data' ][ filepath ] = {
+                'contents': file_contents,
+                'filetypes': [ 'python' ]
+              }
+            except IOError as e:
+              LOGGER.error( f"GoToImplementation: Error reading file {filepath}: {str(e)}" )
+              # If we can't read the file, just return the current location
+              return current_location
+
+          # Make sure line_num is valid for this file
+          try:
+            file_contents = new_request_data[ 'file_data' ][ filepath ][ 'contents' ]
+            lines = file_contents.splitlines()
+            if line_num <= 0 or line_num > len( lines ):
+              LOGGER.error( f"GoToImplementation: Invalid line number {line_num} for file with {len(lines)} lines" )
+              return current_location
+
+            # Check if the line starts with 'import' or 'from'
+            line_content = lines[ line_num - 1 ]
+            LOGGER.info( f"GoToImplementation: Checking line: '{line_content}'" )
+            is_import = line_content.strip().startswith( ( 'import ', 'from ' ) )
+
+            if not is_import:
+              LOGGER.info( "GoToImplementation: Found non-import definition, stopping here" )
+              # We've found a non-import definition, stop here
+              return current_location
+
+            LOGGER.info( "GoToImplementation: Found import statement, continuing to next definition" )
+
+            # Make sure we have proper start_column and start_codepoint
+            # Find the first word on the line to use as a reference point
+            words = [ w for w in line_content.split() if w ]
+
+          except Exception as e:
+            LOGGER.error( f"GoToImplementation: Error processing line: {str(e)}" )
+            return current_location
+
+          # Update the request data for the next iteration
+          # current_request_data = new_request_data
+          # LOGGER.info( f"this time we construct data \n{safe_serialize(new_request_data)}" )
+          try:
+            current_request_data = RequestWrap(new_request_data)
+            LOGGER.info("GoToImplementation: Successfully created RequestWrap")
+          except Exception as e:
+            LOGGER.exception(f"GoToImplementation: Failed to create RequestWrap: {str(e)}")
+
+        except Exception as e:
+          LOGGER.exception( f"GoToImplementation: Error during lookup: {str(e)}" )
+          # If anything goes wrong, just return what we have so far
+          if previous_locations:
+            # Try to reconstruct the last valid location
+            last_filepath, last_line, last_column = previous_locations[ -1 ]
+            return {
+                'filepath': last_filepath,
+                'line_num': last_line,
+                'column_num': last_column
+            }
+          else:
+            # If we have no previous locations, propagate the error
+            raise RuntimeError( f"Can't jump to implementation: {str(e)}" )
+
+      LOGGER.info( f"GoToImplementation: Reached maximum iterations ({max_iterations})" )
+      # If we've exhausted our iterations, return the last location
+      if previous_locations:
+        last_filepath, last_line, last_column = previous_locations[ -1 ]
+        return {
+          'filepath': last_filepath,
+          'line_num': last_line,
+          'column_num': last_column
+
+        }
+
+      LOGGER.error( "GoToImplementation: No valid implementation found" )
+      raise RuntimeError( "Can't jump to implementation." )
 
   def GetSubcommandsMap( self ):
     return {
@@ -281,6 +463,9 @@ class PythonCompleter( Completer ):
                            self._GoToDefinition( request_data ) ),
       'GoToDeclaration': ( lambda self, request_data, args:
                            self._GoToDefinition( request_data ) ),
+
+      'GoToImplementation': (lambda self, request_data, args:
+                           self._GoToImplementation(request_data)),
       'GoToReferences' : ( lambda self, request_data, args:
                            self._GoToReferences( request_data ) ),
       'GoToSymbol'     : ( lambda self, request_data, args:

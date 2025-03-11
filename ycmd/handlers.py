@@ -84,6 +84,7 @@ def GetSignatureHelpAvailable( request, response ):
 @app.post( '/run_completer_command' )
 def RunCompleterCommand( request, response ):
   request_data = RequestWrap( request.json )
+  # LOGGER.info( f"i receive a request: \n{json.dumps(request.json, indent=2)}" )
   completer = _GetCompleterForRequestData( request_data )
 
   return _JsonResponse( completer.OnUserCommand(
