@@ -290,6 +290,57 @@ class PythonCompleter( Completer ):
         candidate[ 'extra_data' ] = self._GetExtraData( completion )
     return candidates
 
+  def _is_import_statement(self, line_content, file_contents, line_num):
+    """
+    Detect if the current line is part of an import statement, including multi-line imports.
+
+    Args:
+        line_content: The content of the current line
+        file_contents: The full file contents
+        line_num: The current line number (1-based)
+
+    Returns:
+        bool: True if this is an import statement, False otherwise
+    """
+    # Check for simple single-line import statements
+    stripped_line = line_content.strip()
+    if stripped_line.startswith(('import ', 'from ')):
+        # Check if this is a complete import or continues to next line
+        if stripped_line.endswith(('\\', '(')):
+            return True
+        # No continuation character, but still an import
+        return True
+
+    # Check if we're inside a multi-line import with parentheses
+    # First, check lines above the current one
+    lines = file_contents.splitlines()
+
+    # Look for an opening parenthesis in preceding lines
+    i = line_num - 2  # -2 because line_num is 1-based, and we want to start from the previous line
+    open_paren_line = -1
+    while i >= 0:
+        prev_line = lines[i].strip()
+        if prev_line.startswith(('import ', 'from ')) and '(' in prev_line and ')' not in prev_line:
+            open_paren_line = i
+            break
+        elif ')' in prev_line:  # We've gone past the end of a different statement
+            break
+        i -= 1
+
+    # If we found an opening parenthesis in an import statement above
+    if open_paren_line >= 0:
+        # Now check if we're still inside this multi-line import (no closing parenthesis yet)
+        for j in range(open_paren_line + 1, line_num):
+            if ')' in lines[j] and j < line_num - 1:
+                # Found closing parenthesis before our current line
+                return False
+
+        # If we're still in an open multi-line import or on the closing line
+        return ')' in line_content or ')' not in line_content
+
+    return False
+
+
   def _GoToImplementation( self, request_data ):
       """Navigate to the implementation of the symbol under the cursor.
 
@@ -400,7 +451,7 @@ class PythonCompleter( Completer ):
             # Check if the line starts with 'import' or 'from'
             line_content = lines[ line_num - 1 ]
             LOGGER.info( f"GoToImplementation: Checking line: '{line_content}'" )
-            is_import = line_content.strip().startswith( ( 'import ', 'from ' ) )
+            is_import = self._is_import_statement(line_content, file_contents, line_num)
 
             if not is_import:
               LOGGER.info( "GoToImplementation: Found non-import definition, stopping here" )

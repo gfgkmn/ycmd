@@ -48,11 +48,6 @@ class HmacPlugin:
 
   def __call__( self, callback ):
     def wrapper( request, response ):
-      if not HostHeaderCorrect( request ):
-        LOGGER.info( 'Dropping request with bad Host header' )
-        abort( HTTP_UNAUTHORIZED, 'Unauthorized, received bad Host header.' )
-        return
-
       if not RequestAuthenticated( request.method,
                                    request.path,
                                    request.body,
