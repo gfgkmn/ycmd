@@ -20,6 +20,9 @@ import platform
 import sys
 import time
 import traceback
+import os
+import tempfile
+import subprocess
 
 
 import ycmd.web_plumbing
@@ -45,9 +48,194 @@ app = ycmd.web_plumbing.AppProducer()
 wsgi_server = None
 
 
+def _NormalizeFileData( request_json ):
+  """
+  Normalize file_data to ensure all files have 'contents' field.
+  Handles different content formats: diff or reading from disk.
+  Also handles file creation when requested.
+  """
+  if 'file_data' not in request_json:
+    return request_json
+
+  # Make a copy to avoid modifying the original
+  normalized = dict( request_json )
+  normalized['file_data'] = {}
+
+  for filepath, file_data in request_json['file_data'].items():
+    normalized_file_data = dict( file_data )
+
+    # Check if we need to create or update this file on the server
+    # This flag is set when:
+    # 1. First time entering a notebook (create base file)
+    # 2. After explicit save (update base file)
+    create_if_needed = file_data.get('create_if_needed', False)
+
+    # If contents already exists
+    if 'contents' in file_data:
+      contents = file_data['contents']
+
+      # If create_if_needed is True, write/update the file to disk
+      if create_if_needed:
+        # Security check: only allow file creation in temp directories
+        temp_dirs = [
+          tempfile.gettempdir(),  # System temp dir (e.g., /tmp on Unix)
+          '/tmp',
+          '/var/tmp',
+          os.path.join( tempfile.gettempdir(), 'ycmd' )
+        ]
+
+        # Check if filepath is in one of the allowed temp directories
+        is_in_temp = any(
+          os.path.abspath( filepath ).startswith( os.path.abspath( temp_dir ) )
+          for temp_dir in temp_dirs if os.path.exists( temp_dir )
+        )
+
+        if not is_in_temp:
+          LOGGER.warning(
+            f'Refused to create/update file {filepath} - create_if_needed only allowed in temp directories'
+          )
+        else:
+          try:
+            # Create directory if it doesn't exist
+            directory = os.path.dirname( filepath )
+            if directory and not os.path.exists( directory ):
+              os.makedirs( directory, exist_ok=True )
+
+            # Write the file (create new or overwrite existing)
+            with open( filepath, 'w', encoding='utf-8' ) as f:
+              f.write( contents )
+
+            if os.path.exists( filepath ):
+              LOGGER.info( f'Updated temp file {filepath} as requested by client' )
+            else:
+              LOGGER.info( f'Created temp file {filepath} as requested by client' )
+          except Exception as e:
+            LOGGER.error( f'Failed to create/update temp file {filepath}: {e}' )
+
+      normalized_file_data['contents'] = contents
+      # Remove the create_if_needed flag from normalized data
+      normalized_file_data.pop('create_if_needed', None)
+      normalized['file_data'][filepath] = normalized_file_data
+      continue
+
+    # If diff exists, apply it to get contents
+    if 'diff' in file_data:
+      contents = _ApplyDiff( filepath, file_data['diff'] )
+
+      # If create_if_needed is True, update the base file with the new content
+      # This happens after explicit saves
+      if create_if_needed:
+        # Security check: only allow file updates in temp directories
+        temp_dirs = [
+          tempfile.gettempdir(),
+          '/tmp',
+          '/var/tmp',
+          os.path.join( tempfile.gettempdir(), 'ycmd' )
+        ]
+
+        is_in_temp = any(
+          os.path.abspath( filepath ).startswith( os.path.abspath( temp_dir ) )
+          for temp_dir in temp_dirs if os.path.exists( temp_dir )
+        )
+
+        if is_in_temp and os.path.exists( filepath ):
+          try:
+            with open( filepath, 'w', encoding='utf-8' ) as f:
+              f.write( contents )
+            LOGGER.info( f'Updated base file {filepath} after save' )
+          except Exception as e:
+            LOGGER.warning( f'Failed to update base file {filepath}: {e}' )
+
+      normalized_file_data['contents'] = contents
+      # Remove diff from normalized data
+      normalized_file_data.pop('diff', None)
+      normalized_file_data.pop('create_if_needed', None)
+      normalized['file_data'][filepath] = normalized_file_data
+      continue
+
+    # Otherwise, read from disk (for unmodified files)
+    contents = _ReadFileContents( filepath )
+    normalized_file_data['contents'] = contents
+    normalized_file_data.pop('create_if_needed', None)
+    normalized['file_data'][filepath] = normalized_file_data
+
+  return normalized
+
+
+def _ReadFileContents( filepath ):
+  """Read file contents from disk."""
+  if os.path.exists( filepath ):
+    try:
+      with open( filepath, 'r', encoding='utf-8' ) as f:
+        return f.read()
+    except Exception as e:
+      LOGGER.warning( f'Failed to read file {filepath}: {e}' )
+  return ''
+
+
+def _ApplyDiff( filepath, diff_content ):
+  """Apply a unified diff to the file on disk to get current content."""
+  if not os.path.exists( filepath ):
+    LOGGER.warning( f'Cannot apply diff: file {filepath} does not exist' )
+    return ''
+
+  try:
+    # Read the original file
+    with open( filepath, 'r', encoding='utf-8' ) as f:
+      original_content = f.read()
+
+    # Create temp files for patch operation
+    with tempfile.NamedTemporaryFile( mode='w', suffix='.orig', delete=False ) as orig_file:
+      orig_file.write( original_content )
+      orig_path = orig_file.name
+
+    with tempfile.NamedTemporaryFile( mode='w', suffix='.diff', delete=False ) as diff_file:
+      diff_file.write( diff_content )
+      diff_path = diff_file.name
+
+    # Create output temp file
+    with tempfile.NamedTemporaryFile( mode='w', suffix='.patched', delete=False ) as out_file:
+      out_path = out_file.name
+
+    try:
+      # Apply the patch to a file instead of stdout to avoid status messages
+      # Use --silent to suppress informational messages
+      result = subprocess.run(
+        ['patch', '--silent', '-o', out_path, orig_path],
+        stdin=open( diff_path, 'r' ),
+        capture_output=True,
+        text=True
+      )
+
+      if result.returncode == 0:
+        # Read the patched content from the output file
+        with open( out_path, 'r', encoding='utf-8' ) as f:
+          return f.read()
+      else:
+        LOGGER.warning( f'Failed to apply diff for {filepath}: {result.stderr}' )
+        # Fall back to original content
+        return original_content
+
+    finally:
+      # Clean up temp files
+      if os.path.exists( orig_path ):
+        os.unlink( orig_path )
+      if os.path.exists( diff_path ):
+        os.unlink( diff_path )
+      if os.path.exists( out_path ):
+        os.unlink( out_path )
+
+  except Exception as e:
+    LOGGER.error( f'Error applying diff for {filepath}: {e}' )
+    # Try to return file content as fallback
+    return _ReadFileContents( filepath )
+
+
 @app.post( '/event_notification' )
 def EventNotification( request, response ):
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   event_name = request_data[ 'event_name' ]
   LOGGER.debug( 'Event name: %s', event_name )
 
@@ -83,9 +271,25 @@ def GetSignatureHelpAvailable( request, response ):
 
 @app.post( '/run_completer_command' )
 def RunCompleterCommand( request, response ):
-  request_data = RequestWrap( request.json )
+  # Preprocess the request to normalize file_data contents
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   # LOGGER.info( f"i receive a request: \n{json.dumps(request.json, indent=2)}" )
   completer = _GetCompleterForRequestData( request_data )
+
+  # Get server info from request environment
+  env = request.env
+  scheme = env.get('wsgi.url_scheme', 'http')
+  server_name = env.get('SERVER_NAME', 'localhost')
+  server_port = env.get('SERVER_PORT', '80')
+
+  # Build full URL
+  full_url = f"{scheme}://{server_name}:{server_port}{request.path}"
+
+  LOGGER.debug(f"[ycmd] Received POST /run_completer_command")
+  LOGGER.debug(f"[ycmd] Server: {server_name}:{server_port}")
+  LOGGER.debug(f"[ycmd] URL: {full_url}")
+  LOGGER.debug(f"[ycmd] Request parameters: {request.json}")
 
   return _JsonResponse( completer.OnUserCommand(
       request_data[ 'command_arguments' ],
@@ -94,7 +298,9 @@ def RunCompleterCommand( request, response ):
 
 @app.post( '/resolve_fixit' )
 def ResolveFixit( request, response ):
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   completer = _GetCompleterForRequestData( request_data )
 
   return _JsonResponse( completer.ResolveFixit( request_data ), response )
@@ -102,7 +308,9 @@ def ResolveFixit( request, response ):
 
 @app.post( '/completions' )
 def GetCompletions( request, response ):
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   do_filetype_completion = _server_state.ShouldUseFiletypeCompleter(
     request_data )
   LOGGER.debug( 'Using filetype completion: %s', do_filetype_completion )
@@ -139,7 +347,9 @@ def GetCompletions( request, response ):
 
 @app.post( '/resolve_completion' )
 def ResolveCompletionItem( request, response ):
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   completer = _GetCompleterForRequestData( request_data )
 
   errors = None
@@ -155,7 +365,9 @@ def ResolveCompletionItem( request, response ):
 
 @app.post( '/signature_help' )
 def GetSignatureHelp( request, response ):
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
 
   if not _server_state.FiletypeCompletionUsable( request_data[ 'filetypes' ],
                                                  silent = True ):
@@ -181,7 +393,9 @@ def GetSignatureHelp( request, response ):
 @app.post( '/semantic_tokens' )
 def GetSemanticTokens( request, response ):
   LOGGER.info( 'Received semantic tokens request' )
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
 
   if not _server_state.FiletypeCompletionUsable( request_data[ 'filetypes' ],
                                                  silent = True ):
@@ -209,7 +423,9 @@ def GetSemanticTokens( request, response ):
 @app.post( '/inlay_hints' )
 def GetInlayHints( request, response ):
   LOGGER.info( 'Received inlay hints request' )
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
 
   if not _server_state.FiletypeCompletionUsable( request_data[ 'filetypes' ],
                                                  silent = True ):
@@ -279,7 +495,9 @@ def DefinedSubcommands( request, response ):
 
 @app.post( '/detailed_diagnostic' )
 def GetDetailedDiagnostic( request, response ):
-  request_data = RequestWrap( request.json )
+  # Normalize file_data to ensure all files have 'contents' field
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   completer = _GetCompleterForRequestData( request_data )
 
   return _JsonResponse( completer.GetDetailedDiagnostic( request_data ),
