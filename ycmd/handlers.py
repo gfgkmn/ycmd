@@ -286,7 +286,7 @@ def RunCompleterCommand( request, response ):
   # Build full URL
   full_url = f"{scheme}://{server_name}:{server_port}{request.path}"
 
-  LOGGER.debug(f"[ycmd] Received POST /run_completer_command")
+  LOGGER.debug("[ycmd] Received POST /run_completer_command")
   LOGGER.debug(f"[ycmd] Server: {server_name}:{server_port}")
   LOGGER.debug(f"[ycmd] URL: {full_url}")
   LOGGER.debug(f"[ycmd] Request parameters: {request.json}")
@@ -453,7 +453,8 @@ def GetInlayHints( request, response ):
 def FilterAndSortCandidates( request, response ):
   # Not using RequestWrap because no need and the requests coming in aren't like
   # the usual requests we handle.
-  request_data = request.json
+  processed_json = _NormalizeFileData( request.json )
+  request_data = processed_json
 
   return _JsonResponse( FilterAndSortCandidatesWrap(
     request_data[ 'candidates' ],
@@ -482,13 +483,17 @@ def GetReady( request, response ):
 
 @app.post( '/semantic_completion_available' )
 def FiletypeCompletionAvailable( request, response ):
+  processed_json = _NormalizeFileData( request.json )
+  LOGGER.debug(f"[ycmd] Request parameters: {processed_json}")
+  LOGGER.debug(f"[ycmd] response parameters: {response}")
   return _JsonResponse( _server_state.FiletypeCompletionAvailable(
-      RequestWrap( request.json )[ 'filetypes' ] ), response )
+      RequestWrap( processed_json )[ 'filetypes' ] ), response )
 
 
 @app.post( '/defined_subcommands' )
 def DefinedSubcommands( request, response ):
-  completer = _GetCompleterForRequestData( RequestWrap( request.json ) )
+  processed_json = _NormalizeFileData( request.json )
+  completer = _GetCompleterForRequestData( RequestWrap( processed_json ) )
 
   return _JsonResponse( completer.DefinedSubcommands(), response )
 
@@ -506,7 +511,8 @@ def GetDetailedDiagnostic( request, response ):
 
 @app.post( '/load_extra_conf_file' )
 def LoadExtraConfFile( request, response ):
-  request_data = RequestWrap( request.json, validate = False )
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json, validate = False )
   extra_conf_store.Load( request_data[ 'filepath' ], force = True )
 
   return _JsonResponse( True, response )
@@ -514,7 +520,8 @@ def LoadExtraConfFile( request, response ):
 
 @app.post( '/ignore_extra_conf_file' )
 def IgnoreExtraConfFile( request, response ):
-  request_data = RequestWrap( request.json, validate = False )
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json, validate = False )
   extra_conf_store.Disable( request_data[ 'filepath' ] )
 
   return _JsonResponse( True, response )
@@ -522,7 +529,8 @@ def IgnoreExtraConfFile( request, response ):
 
 @app.post( '/debug_info' )
 def DebugInfo( request, response ):
-  request_data = RequestWrap( request.json )
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
 
   has_clang_support = ycm_core.HasClangSupport()
   clang_version = ycm_core.ClangVersion() if has_clang_support else None
@@ -572,7 +580,8 @@ def ReceiveMessages( request, response ):
   # The client makes the request with a long timeout (1 hour).
   # When we have data to send, we send it and close the socket.
   # The client then sends a new request.
-  request_data = RequestWrap( request.json )
+  processed_json = _NormalizeFileData( request.json )
+  request_data = RequestWrap( processed_json )
   try:
     completer = _GetCompleterForRequestData( request_data )
   except Exception:
