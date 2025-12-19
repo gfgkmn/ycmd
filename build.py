@@ -964,13 +964,13 @@ def EnableGoCompleter( args ):
   new_env.pop( 'GOROOT', None )
   new_env[ 'GOBIN' ] = p.join( new_env[ 'GOPATH' ], 'bin' )
 
-  gopls = 'golang.org/x/tools/gopls@v0.16.2'
+  gopls = 'golang.org/x/tools/gopls@latest'
   CheckCall( [ go, 'install', gopls ],
              env = new_env,
              quiet = args.quiet,
              status_message = 'Building gopls for go completion',
              on_failure = lambda msg, code: CheckCall(
-               [ go, 'get', gopls ],
+               [ go, 'install', gopls ],
                env = new_env,
                quiet = args.quiet,
                status_message = 'Trying legacy get get' ) )

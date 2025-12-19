@@ -197,6 +197,17 @@ def Settings( **kwargs ):
       }
     }
 
+  if language == 'wolfram':
+    return {
+      'language_server': [
+        {
+          'name': 'wolfram',
+          'filetypes': ['wolfram'],   # see note below
+          'cmdline': ['/Users/gfgkmn/Applications/bin/wolfram_emacs']
+        }
+      ]
+    }
+
   return {}
 
 
